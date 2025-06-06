@@ -1,0 +1,133 @@
+.face-verification {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: 20px;
+}
+
+.video-container {
+  position: relative;
+  width: 640px;
+  height: 480px;
+  background-color: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.video-container video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.face-mesh-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.verification-status {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.steps {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.step {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  background-color: #f5f5f5;
+  border-radius: 8px;
+  transition: all 0.3s ease;
+}
+
+.step.active {
+  background-color: #e3f2fd;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.step.completed {
+  background-color: #e8f5e9;
+}
+
+.step-number {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #fff;
+  border-radius: 50%;
+  font-weight: bold;
+  color: #666;
+}
+
+.step.completed .step-number {
+  background-color: #4caf50;
+  color: #fff;
+}
+
+.step-label {
+  font-size: 14px;
+  color: #666;
+  text-align: center;
+}
+
+.message {
+  padding: 12px;
+  background-color: #f5f5f5;
+  border-radius: 8px;
+  text-align: center;
+  color: #666;
+  min-height: 20px;
+}
+
+.start-button {
+  padding: 12px 24px;
+  background-color: #2196f3;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+}
+
+.start-button:hover {
+  background-color: #1976d2;
+}
+
+.start-button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+.error-message {
+  color: #f44336;
+  margin: 1rem 0;
+  text-align: center;
+  font-size: 1rem;
+}
+
+.success-message {
+  color: #4caf50;
+  margin: 1rem 0;
+  text-align: center;
+  font-size: 1.2rem;
+  font-weight: bold;
+} 
