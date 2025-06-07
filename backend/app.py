@@ -6,6 +6,9 @@ import cv2
 import base64
 from PIL import Image
 import io
+import insightface
+from insightface.app import FaceAnalysis
+import onnxruntime
 
 app = Flask(__name__)
 CORS(app)
@@ -19,13 +22,29 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
+# Initialize InsightFace
+try:
+    face_analyzer = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+    face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+    print("Successfully loaded InsightFace model")
+except Exception as e:
+    print(f"Error loading InsightFace model: {str(e)}")
+    face_analyzer = None
+
 # Constants for verification
 TURN_THRESHOLD = 30  # Increased threshold for more pronounced turns
 BRIGHTNESS_THRESHOLD = 50
 CONTRAST_THRESHOLD = 20
-EAR_THRESHOLD = 0.25  # More sensitive threshold for eyes closed
-EAR_OPEN_THRESHOLD = 0.30  # More sensitive threshold for eyes open
-MIN_EYE_CLOSED_TIME = 0.5  # Reduced minimum time for eyes closed (in seconds)
+FACE_DISTANCE_THRESHOLD = 0.3  # Threshold for face distance (normalized)
+FACE_CENTER_THRESHOLD = 0.2  # Threshold for face centering (normalized)
+FACE_STRAIGHT_THRESHOLD = 2.0  # Threshold for face straightness (degrees)
+
+# Load age and gender models
+try:
+    age_model = load_model('models/age_model.h5')
+    gender_model = load_model('models/gender_model.h5')
+except:
+    print("Warning: Age and gender models not found. Please ensure models are in the models directory.")
 
 # Face mesh connections for visualization
 FACE_MESH_CONNECTIONS = [
@@ -146,57 +165,132 @@ def check_lighting(image):
         print(f"Error checking lighting: {str(e)}")
         return {'status': 'poor', 'brightness': 0, 'contrast': 0}
 
-def detect_eye_state(landmarks):
+def check_face_position(landmarks, image_shape):
     try:
-        # Convert landmarks to numpy array
-        points = np.array([[lm.x, lm.y] for lm in landmarks.landmark])
+        # Get face bounding box
+        points = np.array([[lm.x * image_shape[1], lm.y * image_shape[0]] for lm in landmarks.landmark])
+        x_min, y_min = np.min(points, axis=0)
+        x_max, y_max = np.max(points, axis=0)
         
-        # Calculate eye aspect ratios
-        left_eye = points[33:46]
-        right_eye = points[362:375]
+        # Calculate face size relative to image
+        face_width = (x_max - x_min) / image_shape[1]
+        face_height = (y_max - y_min) / image_shape[0]
+        face_size = max(face_width, face_height)
         
-        # Calculate EAR for left eye
-        left_ear = np.mean([
-            np.linalg.norm(left_eye[1] - left_eye[5]),
-            np.linalg.norm(left_eye[2] - left_eye[4])
-        ]) / (2.0 * np.linalg.norm(left_eye[0] - left_eye[3]))
+        # Calculate face center position
+        face_center_x = (x_min + x_max) / (2 * image_shape[1])
+        face_center_y = (y_min + y_max) / (2 * image_shape[0])
         
-        # Calculate EAR for right eye
-        right_ear = np.mean([
-            np.linalg.norm(right_eye[1] - right_eye[5]),
-            np.linalg.norm(right_eye[2] - right_eye[4])
-        ]) / (2.0 * np.linalg.norm(right_eye[0] - right_eye[3]))
+        # Check if face is centered
+        is_centered = (
+            abs(face_center_x - 0.5) < FACE_CENTER_THRESHOLD and
+            abs(face_center_y - 0.5) < FACE_CENTER_THRESHOLD
+        )
         
-        # Average EAR
-        ear = float((left_ear + right_ear) / 2.0)
-        
-        # Check if eyes are closed (more sensitive detection)
-        is_closed = left_ear < EAR_THRESHOLD or right_ear < EAR_THRESHOLD
-        is_open = left_ear > EAR_OPEN_THRESHOLD and right_ear > EAR_OPEN_THRESHOLD
-        
-        # Calculate eye movement
-        left_eye_center = np.mean(left_eye, axis=0)
-        right_eye_center = np.mean(right_eye, axis=0)
+        # Check if face is close enough
+        is_close = face_size > FACE_DISTANCE_THRESHOLD
         
         return {
-            'is_closed': bool(is_closed),
-            'is_open': bool(is_open),
-            'ear': float(ear),
-            'left_ear': float(left_ear),
-            'right_ear': float(right_ear),
-            'left_eye_center': [float(left_eye_center[0]), float(left_eye_center[1])],
-            'right_eye_center': [float(right_eye_center[0]), float(right_eye_center[1])]
+            'is_centered': bool(is_centered),
+            'is_close': bool(is_close),
+            'face_size': float(face_size),
+            'face_center': [float(face_center_x), float(face_center_y)]
         }
     except Exception as e:
-        print(f"Error detecting eye state: {str(e)}")
+        print(f"Error checking face position: {str(e)}")
         return {
-            'is_closed': False,
-            'is_open': False,
-            'ear': 1.0,
-            'left_ear': 1.0,
-            'right_ear': 1.0,
-            'left_eye_center': [0.0, 0.0],
-            'right_eye_center': [0.0, 0.0]
+            'is_centered': False,
+            'is_close': False,
+            'face_size': 0.0,
+            'face_center': [0.5, 0.5]
+        }
+
+def analyze_face(image, landmarks):
+    try:
+        if face_analyzer is None:
+            raise Exception("Face analyzer not initialized")
+
+        # Get face region using MediaPipe landmarks
+        points = np.array([[lm.x * image.shape[1], lm.y * image.shape[0]] for lm in landmarks.landmark])
+        x_min, y_min = np.min(points, axis=0)
+        x_max, y_max = np.max(points, axis=0)
+        
+        # Add padding
+        padding = 0.2
+        x_min = max(0, int(x_min - (x_max - x_min) * padding))
+        y_min = max(0, int(y_min - (y_max - y_min) * padding))
+        x_max = min(image.shape[1], int(x_max + (x_max - x_min) * padding))
+        y_max = min(image.shape[0], int(y_max + (y_max - y_min) * padding))
+        
+        # Extract face region
+        face_region = image[y_min:y_max, x_min:x_max]
+        
+        # Resize to a standard size for better analysis
+        face_resized = cv2.resize(face_region, (640, 640))
+        
+        # Convert to RGB for InsightFace
+        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+        
+        # Analyze face
+        faces = face_analyzer.get(face_rgb)
+        
+        if not faces:
+            # If InsightFace fails, try analyzing the original image
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            faces = face_analyzer.get(image_rgb)
+            
+            if not faces:
+                raise Exception("No face detected in the image")
+        
+        face = faces[0]  # Get the first face
+        
+        # Get gender prediction
+        gender = 'Male' if face.gender == 1 else 'Female'
+        
+        # Get gender confidence
+        gender_confidence = 0.0
+        try:
+            # Try to get confidence from various possible attributes
+            if hasattr(face, 'gender_score') and face.gender_score is not None:
+                gender_confidence = float(face.gender_score)
+            elif hasattr(face, 'det_score') and face.det_score is not None:
+                gender_confidence = float(face.det_score)
+            elif hasattr(face, 'score') and face.score is not None:
+                gender_confidence = float(face.score)
+            
+            # If we still have 0.0, try to get it from the face object's dictionary
+            if gender_confidence == 0.0 and hasattr(face, '__dict__'):
+                face_dict = face.__dict__
+                for key in ['gender_score', 'det_score', 'score']:
+                    if key in face_dict and face_dict[key] is not None:
+                        gender_confidence = float(face_dict[key])
+                        break
+            
+            # Print debug information
+            print("Face object attributes:", dir(face))
+            print("Face object dict:", face.__dict__ if hasattr(face, '__dict__') else "No dict")
+            print(f"Gender: {gender}, Confidence: {gender_confidence}")
+            
+        except (ValueError, TypeError, AttributeError) as e:
+            print(f"Error getting gender confidence: {str(e)}")
+            gender_confidence = 0.0
+        
+        return {
+            'gender': gender,
+            'gender_confidence': gender_confidence,
+            'face_bbox': {
+                'x_min': int(x_min),
+                'y_min': int(y_min),
+                'x_max': int(x_max),
+                'y_max': int(y_max)
+            }
+        }
+    except Exception as e:
+        print(f"Error analyzing face: {str(e)}")
+        return {
+            'gender': 'Unknown',
+            'gender_confidence': 0.0,
+            'face_bbox': None
         }
 
 @app.route('/verify-frame', methods=['POST'])
@@ -239,23 +333,10 @@ def verify_frame():
         # Convert landmarks to list format for visualization
         landmarks = [[float(lm.x), float(lm.y), float(lm.z)] for lm in face_landmarks.landmark]
         
-        # Check lighting first
-        lighting = check_lighting(image)
-        if lighting['status'] == 'poor':
-            return jsonify({
-                'success': True,
-                'lighting': 'poor',
-                'node_passed': False,
-                'message': 'Lighting is too poor',
-                'landmarks': landmarks,
-                'connections': FACE_MESH_CONNECTIONS
-            })
-        
         # Initialize variables
         node_passed = False
         message = ''
         head_pose = None
-        eye_state = None
         
         # Verify the expected node
         expected_node = data['expected_node']
@@ -284,33 +365,83 @@ def verify_frame():
             else:
                 message = 'Could not detect head pose'
                 
-        elif expected_node == 'blink':
-            eye_state = detect_eye_state(face_landmarks)
-            if eye_state['is_closed']:
-                message = 'Eyes closed - keep them closed for a moment'
-            elif eye_state['is_open']:
-                message = 'Eyes open - close them slowly'
-            else:
-                message = 'Please close your eyes slowly'
-        
-        # Convert head_pose values to native Python types if present
-        if head_pose:
-            head_pose = {
-                'pitch': float(head_pose['pitch']),
-                'yaw': float(head_pose['yaw']),
-                'roll': float(head_pose['roll'])
+        elif expected_node == 'analyze_face':
+            # Check all conditions simultaneously
+            conditions = {
+                'lighting': False,
+                'angle': False,
+                'position': False
             }
+            messages = []
+            
+            # Check lighting
+            lighting = check_lighting(image)
+            conditions['lighting'] = lighting['status'] == 'good'
+            if not conditions['lighting']:
+                messages.append('Please improve lighting conditions')
+            
+            # Check face angle
+            head_pose = calculate_head_pose(face_landmarks, image.shape)
+            if head_pose:
+                yaw = head_pose['yaw']
+                conditions['angle'] = abs(yaw) <= 10  # Using -10 to 10 degrees range
+                if not conditions['angle']:
+                    messages.append(f'Please face straight ahead (current angle: {yaw:.1f}°)')
+            
+            # Check face position
+            face_position = check_face_position(face_landmarks, image.shape)
+            conditions['position'] = face_position['is_close'] and face_position['is_centered']
+            if not face_position['is_close']:
+                messages.append('Please move your face closer to the camera')
+            elif not face_position['is_centered']:
+                messages.append('Please center your face in the frame')
+            
+            # If all conditions are met
+            if all(conditions.values()):
+                if 'snapshot_taken' in data and data['snapshot_taken']:
+                    analysis = analyze_face(image, face_landmarks)
+                    if analysis['gender'] != 'Unknown':  # Check if analysis was successful
+                        node_passed = True
+                        message = f'Analysis complete: {analysis["gender"]}, {analysis["gender_confidence"]}'
+                    else:
+                        message = 'Could not analyze face. Please try again.'
+                else:
+                    message = 'Hold still for analysis...'
+                    node_passed = True
+            else:
+                message = ' | '.join(messages)
+            
+            # Prepare response
+            response = {
+                'success': True,
+                'lighting': 'good' if conditions['lighting'] else 'poor',
+                'node_passed': bool(node_passed),
+                'message': message,
+                'landmarks': landmarks,
+                'connections': FACE_MESH_CONNECTIONS,
+                'head_pose': head_pose,
+                'face_position': face_position,
+                'conditions': conditions
+            }
+            
+            # Add analysis results if available
+            if 'snapshot_taken' in data and data['snapshot_taken'] and node_passed:
+                response['analysis'] = analyze_face(image, face_landmarks)
+            
+            return jsonify(response)
         
-        return jsonify({
+        # For other nodes (turn_left, turn_right)
+        response = {
             'success': True,
             'lighting': 'good',
             'node_passed': bool(node_passed),
             'message': message,
             'landmarks': landmarks,
             'connections': FACE_MESH_CONNECTIONS,
-            'head_pose': head_pose if expected_node in ['turn_left', 'turn_right'] else None,
-            'eye_state': eye_state if expected_node == 'blink' else None
-        })
+            'head_pose': head_pose if expected_node in ['turn_left', 'turn_right'] else None
+        }
+        
+        return jsonify(response)
             
     except Exception as e:
         print(f"Error in verify-frame endpoint: {str(e)}")

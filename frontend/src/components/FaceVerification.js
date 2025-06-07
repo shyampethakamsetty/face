@@ -1,37 +1,48 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import './FaceVerification.css';
 
 const FaceVerification = () => {
+  const navigate = useNavigate();
   const [currentStep, setCurrentStep] = useState(0);
-  const [verificationStatus, setVerificationStatus] = useState({
-    turnLeft: false,
-    turnRight: false,
-    blink: false
-  });
-  const [stepMessage, setStepMessage] = useState('');
-  const [consecutivePasses, setConsecutivePasses] = useState(0);
   const [isVerifying, setIsVerifying] = useState(false);
-  const [eyeCloseCount, setEyeCloseCount] = useState(0);
-  const [lastEyeCloseTime, setLastEyeCloseTime] = useState(null);
-  const [wasEyesClosed, setWasEyesClosed] = useState(false);
-  const [eyeClosedDuration, setEyeClosedDuration] = useState(0);
-  const [lastEyePosition, setLastEyePosition] = useState(null);
-  const [eyeMovementDetected, setEyeMovementDetected] = useState(false);
+  const [snapshotTaken, setSnapshotTaken] = useState(false);
+  const [holdStill, setHoldStill] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisResult, setAnalysisResult] = useState({
+    gender: '',
+    gender_confidence: 0
+  });
+  const [showSuccess, setShowSuccess] = useState(false);
+  const [finalFrame, setFinalFrame] = useState(null);
+  const [isCompleted, setIsCompleted] = useState(false);
+  const [showStepComplete, setShowStepComplete] = useState(false);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
+  const intervalRef = useRef(null);
+  const successSoundRef = useRef(new Audio('/success-sound.mp3'));
 
   const steps = [
-    { id: 'turn_left', label: 'Turn Left' },
-    { id: 'turn_right', label: 'Turn Right' },
-    { id: 'blink', label: 'Close Eyes Slowly (3 times)' }
+    { id: 'turn_left', label: 'Turn your head to the left' },
+    { id: 'turn_right', label: 'Turn your head to the right' },
+    { id: 'analyze_face', label: 'Center your face for analysis' }
   ];
+
+  const [verificationStatus, setVerificationStatus] = useState({
+    turn_left: false,
+    turn_right: false,
+    analyze_face: false
+  });
+
+  const [stepMessage, setStepMessage] = useState('');
 
   useEffect(() => {
     startCamera();
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
+      stopCamera();
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
       }
     };
   }, []);
@@ -40,98 +51,125 @@ const FaceVerification = () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: { 
-          width: 640,
-          height: 480
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: 'user'
         } 
       });
-      videoRef.current.srcObject = stream;
-      streamRef.current = stream;
-
-      // Set canvas dimensions when video is loaded
-      videoRef.current.onloadedmetadata = () => {
-        if (canvasRef.current) {
-          canvasRef.current.width = videoRef.current.videoWidth;
-          canvasRef.current.height = videoRef.current.videoHeight;
-        }
-      };
-    } catch (err) {
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        streamRef.current = stream;
+      }
+    } catch (error) {
+      console.error('Error accessing camera:', error);
       setStepMessage('Error accessing camera. Please ensure camera permissions are granted.');
     }
   };
 
-  const drawFaceMesh = (landmarks, connections) => {
-    if (!landmarks || !connections || !canvasRef.current) return;
-    
-    const canvas = canvasRef.current;
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  const startVerification = () => {
+    setCurrentStep(0);
+    setVerificationStatus({
+      turn_left: false,
+      turn_right: false,
+      analyze_face: false
+    });
+    setSnapshotTaken(false);
+    setAnalysisResult({
+      gender: '',
+      gender_confidence: 0
+    });
+    setFinalFrame(null);
+    setIsCompleted(false);
+    setIsVerifying(true);
+    setStepMessage('Starting verification...');
+  };
+
+  const stopVerification = () => {
+    setIsVerifying(false);
+    setIsCompleted(true);
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    stopCamera();
+    setShowSuccess(true);
+  };
+
+  const getBase64Image = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = videoRef.current.videoWidth;
+    canvas.height = videoRef.current.videoHeight;
     const ctx = canvas.getContext('2d');
+    ctx.drawImage(videoRef.current, 0, 0);
+    return canvas.toDataURL('image/jpeg');
+  };
+
+  const drawFaceMesh = (landmarks, connections) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     
-    // Clear the canvas
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Draw connections
-    ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 2;
-    connections.forEach(([start, end]) => {
-      const startPoint = landmarks[start];
-      const endPoint = landmarks[end];
-      if (startPoint && endPoint) {
-        ctx.beginPath();
-        ctx.moveTo(startPoint[0] * canvas.width, startPoint[1] * canvas.height);
-        ctx.lineTo(endPoint[0] * canvas.width, endPoint[1] * canvas.height);
-        ctx.stroke();
-      }
-    });
+    // Draw video frame
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // Draw landmarks
-    ctx.fillStyle = '#ffff00';
+    // Draw all landmarks as dots
+    ctx.fillStyle = '#00ff00';
     landmarks.forEach(point => {
       ctx.beginPath();
       ctx.arc(point[0] * canvas.width, point[1] * canvas.height, 2, 0, 2 * Math.PI);
       ctx.fill();
     });
+
+    // Draw connections
+    ctx.strokeStyle = '#00ff00';
+    ctx.lineWidth = 1;
+    connections.forEach(connection => {
+      const [start, end] = connection;
+      ctx.beginPath();
+      ctx.moveTo(landmarks[start][0] * canvas.width, landmarks[start][1] * canvas.height);
+      ctx.lineTo(landmarks[end][0] * canvas.width, landmarks[end][1] * canvas.height);
+      ctx.stroke();
+    });
   };
 
-  const checkLighting = async () => {
-    try {
-      const response = await fetch('http://localhost:5000/verify-frame', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          image: getBase64Image(),
-          expected_node: 'turn_left'
-        })
-      });
-      const data = await response.json();
-      
-      if (data.success && data.lighting === 'good') {
-        setVerificationStatus(prev => ({
-          ...prev,
-          turnLeft: true
-        }));
-        setStepMessage('');
-      } else {
-        setStepMessage(data.message || 'Please move to better lighting to continue');
-      }
-
-      if (data.landmarks) {
-        drawFaceMesh(data.landmarks, data.connections);
-      }
-    } catch (err) {
-      setStepMessage('Error checking lighting conditions');
-    }
+  const playSuccessSound = () => {
+    successSoundRef.current.currentTime = 0;
+    successSoundRef.current.play().catch(error => {
+      console.log('Error playing sound:', error);
+    });
   };
 
-  const getBase64Image = () => {
-    const canvas = document.createElement('canvas');
-    canvas.width = 640;
-    canvas.height = 480;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(videoRef.current, 0, 0, 640, 480);
-    return canvas.toDataURL('image/jpeg');
+  const handleStepComplete = (message) => {
+    setShowStepComplete(true);
+    playSuccessSound();
+    setStepMessage(message);
+    setTimeout(() => {
+      setShowStepComplete(false);
+    }, 2000);
   };
 
   const verifyStep = async () => {
-    if (!videoRef.current) return;
+    if (!videoRef.current || isCompleted) return;
     
     const currentStepData = steps[currentStep];
     if (!currentStepData) return;
@@ -145,106 +183,113 @@ const FaceVerification = () => {
         },
         body: JSON.stringify({
           image,
-          expected_node: currentStepData.id
+          expected_node: currentStepData.id,
+          snapshot_taken: snapshotTaken
         }),
       });
 
       const data = await response.json();
       
       if (data.success) {
-        // Draw face mesh
-        if (data.landmarks && data.connections) {
+        if (data.landmarks && data.connections && !isCompleted) {
           drawFaceMesh(data.landmarks, data.connections);
         }
 
-        if (data.lighting === 'poor') {
-          setStepMessage('Please improve lighting conditions');
-          return;
-        }
+        if (currentStepData.id === 'analyze_face') {
+          // Check all conditions at once
+          if (data.conditions) {
+            const allConditionsMet = 
+              data.conditions.lighting && 
+              data.conditions.angle && 
+              data.conditions.position;
 
-        if (currentStepData.id === 'blink') {
-          const now = Date.now();
-          
-          // Check for eye movement
-          if (data.eye_state && data.eye_state.left_eye_center && data.eye_state.right_eye_center) {
-            const currentEyePosition = {
-              left: data.eye_state.left_eye_center,
-              right: data.eye_state.right_eye_center
-            };
-
-            if (lastEyePosition) {
-              const leftEyeMovement = Math.hypot(
-                currentEyePosition.left[0] - lastEyePosition.left[0],
-                currentEyePosition.left[1] - lastEyePosition.left[1]
-              );
-              const rightEyeMovement = Math.hypot(
-                currentEyePosition.right[0] - lastEyePosition.right[0],
-                currentEyePosition.right[1] - lastEyePosition.right[1]
-              );
-
-              if (leftEyeMovement > 0.01 || rightEyeMovement > 0.01) {
-                setEyeMovementDetected(true);
-                setStepMessage('Eye movement detected - keep your eyes still');
+            if (!allConditionsMet) {
+              setAnalyzing(false);
+              const statusMessages = [];
+              if (!data.conditions.lighting) {
+                statusMessages.push('Please improve lighting conditions');
               }
-            }
-            setLastEyePosition(currentEyePosition);
-          }
-
-          if (data.eye_state.is_closed) {
-            if (!wasEyesClosed) {
-              setWasEyesClosed(true);
-              setLastEyeCloseTime(now);
-              setStepMessage('Eyes closed - keep them closed');
-            } else {
-              const duration = (now - lastEyeCloseTime) / 1000;
-              setEyeClosedDuration(duration);
-              
-              if (duration >= 0.5) { // Reduced from 1.0 to 0.5 seconds
-                setEyeCloseCount(prev => prev + 1);
-                setWasEyesClosed(false);
-                setEyeClosedDuration(0);
-                setStepMessage(`Eye close ${eyeCloseCount + 1}/3 completed`);
-                
-                if (eyeCloseCount + 1 >= 3) {
-                  setVerificationStatus(prev => ({
-                    ...prev,
-                    [currentStepData.id]: 'passed'
-                  }));
-                  
-                  const nextStepIndex = currentStep + 1;
-                  if (nextStepIndex < steps.length) {
-                    setCurrentStep(nextStepIndex);
-                    setStepMessage(`Moving to next step: ${steps[nextStepIndex].label}`);
-                  } else {
-                    setStepMessage('Verification completed!');
-                    stopVerification();
+              if (!data.conditions.angle) {
+                statusMessages.push('Please face straight ahead');
+              }
+              if (!data.conditions.position) {
+                if (data.face_position) {
+                  if (!data.face_position.is_close) {
+                    statusMessages.push('Please move your face closer');
+                  }
+                  if (!data.face_position.is_centered) {
+                    statusMessages.push('Please center your face');
                   }
                 }
               }
+              setStepMessage(statusMessages.join(' | '));
+              return;
             }
-          } else if (wasEyesClosed) {
-            setWasEyesClosed(false);
-            setEyeClosedDuration(0);
-            setStepMessage('Please close your eyes slowly');
+
+            // If all conditions are met and we haven't started holding still
+            if (!holdStill) {
+              setHoldStill(true);
+              setAnalyzing(true);
+              setStepMessage('Hold still, analyzing...');
+              // Clear the interval to stop sending requests
+              if (intervalRef.current) {
+                clearInterval(intervalRef.current);
+                intervalRef.current = null;
+              }
+              // Send the final request immediately
+              const finalImage = getBase64Image();
+              fetch('http://localhost:5000/verify-frame', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  image: finalImage,
+                  expected_node: currentStepData.id,
+                  snapshot_taken: true
+                }),
+              })
+                .then(res => res.json())
+                .then(finalData => {
+                  if (finalData.success && finalData.analysis) {
+                    // Save the final frame with mesh
+                    const canvas = canvasRef.current;
+                    if (canvas) {
+                      setFinalFrame(canvas.toDataURL('image/jpeg'));
+                    }
+                    setAnalysisResult({
+                      gender: finalData.analysis.gender,
+                      gender_confidence: finalData.analysis.gender_confidence
+                    });
+                    setVerificationStatus(prev => ({
+                      ...prev,
+                      [currentStepData.id]: true
+                    }));
+                    handleStepComplete(`Analysis complete: ${finalData.analysis.gender} (${(finalData.analysis.gender_confidence * 100).toFixed(1)}% confidence)`);
+                    setAnalyzing(false);
+                    stopVerification();
+                  }
+                });
+              return;
+            }
+          }
+        } else if (data.node_passed) {
+          setVerificationStatus(prev => ({
+            ...prev,
+            [currentStepData.id]: true
+          }));
+          
+          const nextStepIndex = currentStep + 1;
+          if (nextStepIndex < steps.length) {
+            handleStepComplete(`Step completed! Moving to: ${steps[nextStepIndex].label}`);
+            setCurrentStep(nextStepIndex);
+          } else {
+            handleStepComplete('Verification completed!');
+            stopVerification();
+            return;
           }
         } else {
-          if (data.node_passed) {
-            setVerificationStatus(prev => ({
-              ...prev,
-              [currentStepData.id]: 'passed'
-            }));
-            
-            const nextStepIndex = currentStep + 1;
-            if (nextStepIndex < steps.length) {
-              setCurrentStep(nextStepIndex);
-              setStepMessage(`Moving to next step: ${steps[nextStepIndex].label}`);
-            } else {
-              setStepMessage('Verification completed!');
-              stopVerification();
-            }
-          } else {
-            setStepMessage(data.message);
-          }
+          setStepMessage(data.message);
         }
       }
     } catch (error) {
@@ -254,75 +299,103 @@ const FaceVerification = () => {
   };
 
   useEffect(() => {
-    let interval;
-    if (isVerifying) {
-      interval = setInterval(verifyStep, 100);
+    if (isVerifying && !isCompleted) {
+      intervalRef.current = setInterval(verifyStep, 100);
     }
     return () => {
-      if (interval) {
-        clearInterval(interval);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
       }
     };
-  }, [isVerifying, currentStep, consecutivePasses]);
+  }, [isVerifying, currentStep, snapshotTaken, isCompleted]);
 
-  const startVerification = () => {
-    setCurrentStep(0);
-    setVerificationStatus({
-      turnLeft: false,
-      turnRight: false,
-      blink: false
-    });
-    setConsecutivePasses(0);
-    setEyeCloseCount(0);
-    setLastEyeCloseTime(null);
-    setWasEyesClosed(false);
-    setEyeClosedDuration(0);
-    setLastEyePosition(null);
-    setEyeMovementDetected(false);
-    setIsVerifying(true);
-    setStepMessage('Starting verification...');
-  };
-
-  const stopVerification = () => {
-    setIsVerifying(false);
-    setStepMessage('Verification stopped');
+  const handleReturnHome = () => {
+    navigate('/');
   };
 
   return (
     <div className="face-verification">
-      <div className="video-container">
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          style={{ width: '640px', height: '480px' }}
-        />
-        <canvas
-          ref={canvasRef}
-          className="face-mesh-overlay"
-          style={{ width: '640px', height: '480px' }}
-        />
-      </div>
+      <div className="verification-container">
+        <div className={`video-container${analyzing ? ' analyzing' : ''}`}>
+          {!isCompleted ? (
+            <>
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className={showSuccess ? 'hidden' : ''}
+              />
+              <canvas ref={canvasRef} className={showSuccess ? 'hidden' : ''} />
+            </>
+          ) : (
+            finalFrame && (
+              <img 
+                src={finalFrame} 
+                alt="Final verification frame" 
+                className="final-frame"
+              />
+            )
+          )}
+        </div>
 
-      <div className="verification-status">
-        <div className="steps">
+        <div className="progress-bar">
           {steps.map((step, index) => (
-            <div
-              key={step.id}
-              className={`step ${index === currentStep ? 'active' : ''} ${
+            <div 
+              key={step.id} 
+              className={`progress-node ${index === currentStep ? 'active' : ''} ${
                 verificationStatus[step.id] ? 'completed' : ''
               }`}
             >
-              <div className="step-number">{index + 1}</div>
-              <div className="step-label">{step.label}</div>
+              <div className="node-number">{index + 1}</div>
+              <div className="node-label">{step.label}</div>
             </div>
           ))}
         </div>
-        <div className="message">{stepMessage}</div>
-        {!isVerifying && (
-          <button className="start-button" onClick={startVerification}>
-            Start Verification
-          </button>
+
+        <div className="controls">
+          {!isVerifying ? (
+            isCompleted ? (
+              <button onClick={handleReturnHome} className="return-home-button">
+                Return to Home
+              </button>
+            ) : (
+              <button onClick={startVerification} className="start-button">
+                Start Verification
+              </button>
+            )
+          ) : (
+            <button onClick={stopVerification} className="stop-button">
+              Stop Verification
+            </button>
+          )}
+        </div>
+        {!isCompleted && (
+          <div className={`message ${showStepComplete ? 'step-complete' : ''}`}>
+            {stepMessage}
+          </div>
+        )}
+        {analysisResult.gender && (
+          <div className="analysis-result">
+            <h3>Analysis Results</h3>
+            <p>Gender: {analysisResult.gender}</p>
+            <p>Confidence: {(analysisResult.gender_confidence * 100).toFixed(1)}%</p>
+          </div>
+        )}
+
+        {showSuccess && (
+          <div className="success-animation">
+            <div className="success-checkmark">
+              <div className="check-icon">
+                <span className="icon-line line-tip"></span>
+                <span className="icon-line line-long"></span>
+                <div className="icon-circle"></div>
+                <div className="icon-fix"></div>
+              </div>
+            </div>
+            <h2>Verification Complete!</h2>
+          </div>
         )}
       </div>
     </div>
